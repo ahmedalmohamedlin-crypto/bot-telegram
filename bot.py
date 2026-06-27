@@ -1,10 +1,12 @@
 import sys
 import os
 import re
+import threading
 import pytz
 import requests
 from datetime import datetime, timedelta
 
+from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -516,6 +518,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==============================
+# KEEP-ALIVE WEB SERVER
+# ==============================
+# Render's free tier only allows "Web Service" (not Background Worker),
+# and free Web Services spin down after 15 min with no HTTP traffic.
+# This tiny server gives Render something to host, and an external
+# pinger (e.g. UptimeRobot / cron-job.org) hitting "/" every ~10 min
+# keeps the process alive so the Telegram polling loop doesn't die.
+
+keep_alive_app = Flask(__name__)
+
+
+@keep_alive_app.route("/")
+def health_check():
+    return "Bot is running ✅", 200
+
+
+def run_keep_alive_server():
+    port = int(os.environ.get("PORT", 10000))
+    keep_alive_app.run(host="0.0.0.0", port=port)
+
+
+# ==============================
 # MAIN
 # ==============================
 
@@ -536,4 +560,8 @@ def run_telegram_bot():
 
 
 if __name__ == "__main__":
+    # Start the keep-alive web server in a background thread so Render
+    # sees an open port, then run the Telegram bot's polling loop in
+    # the main thread.
+    threading.Thread(target=run_keep_alive_server, daemon=True).start()
     run_telegram_bot()
