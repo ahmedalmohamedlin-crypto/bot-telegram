@@ -16,8 +16,16 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Ensure terminal prints emojis correctly
-sys.stdout.reconfigure(encoding='utf-8')
+# Ensure terminal prints emojis correctly, and force unbuffered output.
+# Render (and most container platforms) buffer stdout when it isn't attached
+# to a real terminal, which silently swallows print() calls until the buffer
+# fills or the process exits. line_buffering=True fixes that.
+sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+
+
+def log(message):
+    """print() that's guaranteed to show up immediately in Render logs."""
+    print(message, flush=True)
 
 # ==============================
 # CONFIG (from environment variables — set these on Render)
@@ -49,14 +57,19 @@ ACCESS_TOKENS = {}
 def fetch_access_token(store):
     """Hit the store's token URL to get a fresh Salla access token."""
     try:
+        log(f"➡️ [{store['name']}] Fetching token from {store['token_url']}")
         response = requests.get(store["token_url"], timeout=15)
+        log(f"⬅️ [{store['name']}] Token endpoint status: {response.status_code}")
         response.raise_for_status()
-        token = response.json().get("access_token")
+        body = response.json()
+        token = body.get("access_token")
         if not token:
-            print(f"⚠️ [{store['name']}] Token endpoint returned no access_token.")
+            log(f"⚠️ [{store['name']}] Token endpoint returned no access_token. Raw body: {body}")
+        else:
+            log(f"✅ [{store['name']}] Got token ending in ...{token[-6:]}")
         return token
     except Exception as e:
-        print(f"⚠️ [{store['name']}] Failed to fetch access token: {e}")
+        log(f"⚠️ [{store['name']}] Failed to fetch access token: {e}")
         return None
 
 
@@ -80,25 +93,33 @@ def salla_get(store_key, url, params=None):
     to even produce a response (e.g. network error).
     """
     token = get_token(store_key)
+    if not token:
+        log(f"❌ [{store_key}] No token available — cannot call {url}")
+        return None
+
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=20)
+        log(f"⬅️ [{store_key}] GET {url} params={params} -> {response.status_code}")
+        if response.status_code != 200:
+            log(f"   Response body: {response.text[:500]}")
     except Exception as e:
-        print(f"❌ [{store_key}] Request error: {e}")
+        log(f"❌ [{store_key}] Request error: {e}")
         return None
 
     if response.status_code == 401:
         # Token likely expired — refresh once and retry.
-        print(f"🔄 [{store_key}] Got 401, refreshing token and retrying...")
+        log(f"🔄 [{store_key}] Got 401, refreshing token and retrying...")
         token = refresh_token(store_key)
         if not token:
             return response  # still return the 401 so callers can handle it
         headers["Authorization"] = f"Bearer {token}"
         try:
             response = requests.get(url, headers=headers, params=params, timeout=20)
+            log(f"⬅️ [{store_key}] RETRY GET {url} -> {response.status_code}")
         except Exception as e:
-            print(f"❌ [{store_key}] Retry request error: {e}")
+            log(f"❌ [{store_key}] Retry request error: {e}")
             return None
 
     return response
@@ -169,15 +190,21 @@ def get_today_orders(store_key):
     params = {"from_date": today_start, "to_date": today_end}
     response = salla_get(store_key, SALLA_ORDERS_URL, params=params)
     if response is None or response.status_code != 200:
+        log(f"❌ [{store_key}] get_today_orders: bad response, returning empty list")
         return []
 
     data = response.json()
+    raw_orders = data.get("data", [])
+    log(f"📊 [{store_key}] get_today_orders: Salla returned {len(raw_orders)} raw orders for {today_start} → {today_end}")
+
     cleaned_data = []
-    for order in data.get("data", []):
+    for order in raw_orders:
         details = get_order_details(store_key, order["id"])
         tags = details.get("tags", [])
         if not tags:
             cleaned_data.append(order)
+
+    log(f"📊 [{store_key}] get_today_orders: {len(cleaned_data)}/{len(raw_orders)} orders had NO tags (tagged orders are filtered out)")
     return cleaned_data
 
 
@@ -217,7 +244,7 @@ def get_orders_by_status(store_key, status_id):
 
         response = salla_get(store_key, SALLA_ORDERS_URL, params=params)
         if response is None or response.status_code != 200:
-            print(f"Error fetching orders by status: {response.status_code if response else 'no response'}")
+            log(f"Error fetching orders by status: {response.status_code if response else 'no response'}")
             break
 
         res_json = response.json()
@@ -551,7 +578,7 @@ def run_telegram_bot():
         token = fetch_access_token(store)
         ACCESS_TOKENS[store["key"]] = token
         status = "✅" if token else "⚠️ failed"
-        print(f"{status} [{store['name']}] token fetch on startup")
+        log(f"{status} [{store['name']}] token fetch on startup")
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
