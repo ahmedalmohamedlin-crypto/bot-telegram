@@ -33,94 +33,58 @@ def log(message):
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
-# Each store needs a name + a "token URL" endpoint that returns {"access_token": "..."}
-# Add/remove stores here if the count ever changes.
+# Each store needs a name + a static Salla access token (the "ory_at_..." string
+# you get from Salla). These are long-lived and rarely expire, so we just read
+# them once at startup — no token-refresh endpoint is involved.
 STORES = [
-    {"key": "store1", "name": os.environ.get("STORE1_NAME", "مايكرو"), "token_url": os.environ["STORE1_TOKEN_URL"]},
-    {"key": "store2", "name": os.environ.get("STORE2_NAME", "بيرق"), "token_url": os.environ["STORE2_TOKEN_URL"]},
-    {"key": "store3", "name": os.environ.get("STORE3_NAME", "الشاهين"), "token_url": os.environ["STORE3_TOKEN_URL"]},
-    {"key": "store4", "name": os.environ.get("STORE4_NAME", "زمرد"), "token_url": os.environ["STORE4_TOKEN_URL"]},
+    {"key": "store1", "name": os.environ.get("STORE1_NAME", "مايكرو"), "access_token": os.environ["STORE1_ACCESS_TOKEN"]},
+    {"key": "store2", "name": os.environ.get("STORE2_NAME", "بيرق"), "access_token": os.environ["STORE2_ACCESS_TOKEN"]},
+    {"key": "store3", "name": os.environ.get("STORE3_NAME", "الشاهين"), "access_token": os.environ["STORE3_ACCESS_TOKEN"]},
+    {"key": "store4", "name": os.environ.get("STORE4_NAME", "زمرد"), "access_token": os.environ["STORE4_ACCESS_TOKEN"]},
 ]
 STORES_BY_KEY = {s["key"]: s for s in STORES}
 
 SALLA_ORDERS_URL = "https://api.salla.dev/admin/v2/orders?"
 SALLA_SHIPPING_URL = "https://api.salla.dev/admin/v2"
 
-# In-memory cache of access tokens per store. Refreshed on startup and on 401.
-ACCESS_TOKENS = {}
-
 
 # ==============================
 # TOKEN HANDLING
 # ==============================
-
-def fetch_access_token(store):
-    """Hit the store's token URL to get a fresh Salla access token."""
-    try:
-        log(f"➡️ [{store['name']}] Fetching token from {store['token_url']}")
-        response = requests.get(store["token_url"], timeout=15)
-        log(f"⬅️ [{store['name']}] Token endpoint status: {response.status_code}")
-        response.raise_for_status()
-        body = response.json()
-        token = body.get("access_token")
-        if not token:
-            log(f"⚠️ [{store['name']}] Token endpoint returned no access_token. Raw body: {body}")
-        else:
-            log(f"✅ [{store['name']}] Got token ending in ...{token[-6:]}")
-        return token
-    except Exception as e:
-        log(f"⚠️ [{store['name']}] Failed to fetch access token: {e}")
-        return None
-
+# These tokens are static (not refreshed via an endpoint), so "get_token" just
+# reads straight from STORES_BY_KEY. If Salla ever invalidates one, salla_get()
+# below will get a 401 and log it clearly so you know to generate a new token
+# in Salla and update the STOREx_ACCESS_TOKEN env var on Render.
 
 def get_token(store_key):
-    """Return cached token for a store, fetching it if missing."""
-    if store_key not in ACCESS_TOKENS or not ACCESS_TOKENS[store_key]:
-        ACCESS_TOKENS[store_key] = fetch_access_token(STORES_BY_KEY[store_key])
-    return ACCESS_TOKENS[store_key]
-
-
-def refresh_token(store_key):
-    """Force-refresh a store's token (called after a 401)."""
-    ACCESS_TOKENS[store_key] = fetch_access_token(STORES_BY_KEY[store_key])
-    return ACCESS_TOKENS[store_key]
+    return STORES_BY_KEY[store_key]["access_token"]
 
 
 def salla_get(store_key, url, params=None):
     """
-    GET request to Salla with automatic token refresh on 401.
-    Returns the requests.Response object, or None if both attempts failed
-    to even produce a response (e.g. network error).
+    GET request to Salla. Returns the requests.Response object, or None if
+    the request itself failed (e.g. network error).
     """
+    store = STORES_BY_KEY[store_key]
     token = get_token(store_key)
     if not token:
-        log(f"❌ [{store_key}] No token available — cannot call {url}")
+        log(f"❌ [{store['name']}] No token configured — cannot call {url}")
         return None
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=20)
-        log(f"⬅️ [{store_key}] GET {url} params={params} -> {response.status_code}")
+        log(f"⬅️ [{store['name']}] GET {url} params={params} -> {response.status_code}")
         if response.status_code != 200:
             log(f"   Response body: {response.text[:500]}")
     except Exception as e:
-        log(f"❌ [{store_key}] Request error: {e}")
+        log(f"❌ [{store['name']}] Request error: {e}")
         return None
 
     if response.status_code == 401:
-        # Token likely expired — refresh once and retry.
-        log(f"🔄 [{store_key}] Got 401, refreshing token and retrying...")
-        token = refresh_token(store_key)
-        if not token:
-            return response  # still return the 401 so callers can handle it
-        headers["Authorization"] = f"Bearer {token}"
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=20)
-            log(f"⬅️ [{store_key}] RETRY GET {url} -> {response.status_code}")
-        except Exception as e:
-            log(f"❌ [{store_key}] Retry request error: {e}")
-            return None
+        log(f"🛑 [{store['name']}] Got 401 Unauthorized — this store's access token is invalid or expired. "
+            f"Generate a new token in Salla and update STORE_ACCESS_TOKEN for this store on Render.")
 
     return response
 
@@ -573,12 +537,14 @@ def run_keep_alive_server():
 def run_telegram_bot():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Warm the token cache for all stores on startup (best-effort; failures are logged, not fatal)
+    # Log a quick sanity check on startup so it's obvious in Render logs
+    # whether each store's token is configured (not whether it's *valid* —
+    # that's confirmed the first time a real API call is made).
     for store in STORES:
-        token = fetch_access_token(store)
-        ACCESS_TOKENS[store["key"]] = token
-        status = "✅" if token else "⚠️ failed"
-        log(f"{status} [{store['name']}] token fetch on startup")
+        token = store["access_token"]
+        masked = f"...{token[-6:]}" if token else "MISSING"
+        status = "✅" if token else "⚠️ MISSING TOKEN"
+        log(f"{status} [{store['name']}] configured token: {masked}")
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))

@@ -10,17 +10,17 @@ services:
         sync: false
       - key: STORE1_NAME
         value: "مايكرو"
-      - key: STORE1_TOKEN_URL
+      - key: STORE1_ACCESS_TOKEN
         sync: false
       - key: STORE2_NAME
         value: "بيرق"
-      - key: STORE2_TOKEN_URL
+      - key: STORE2_ACCESS_TOKEN
         sync: false
       - key: STORE3_NAME
         value: "الشاهين"
-      - key: STORE3_TOKEN_URL
+      - key: STORE3_ACCESS_TOKEN
         sync: false
       - key: STORE4_NAME
         value: "زمرد"
-      - key: STORE4_TOKEN_URL
+      - key: STORE4_ACCESS_TOKEN
         sync: false
